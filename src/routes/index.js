@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { authRouter } from './auth.js';
 import { budgetsRouter } from './budgets.js';
 import { categoriesRouter } from './categories.js';
 import { dashboardRouter } from './dashboard.js';
@@ -10,6 +11,7 @@ router.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+router.use('/auth', authRouter);
 router.use('/categories', categoriesRouter);
 router.use('/budgets', budgetsRouter);
 router.use('/transactions', transactionsRouter);

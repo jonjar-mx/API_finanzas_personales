@@ -13,18 +13,22 @@ dashboardRouter.get('/', asyncHandler(async (req, res) => {
        c.id AS "categoryId",
        c.name AS category,
        b.amount::float AS amount,
-       COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0)::float AS spent,
-       (b.amount - COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0))::float AS remaining,
+       COALESCE(SUM(ti.total_price), 0)::float AS spent,
+       (b.amount - COALESCE(SUM(ti.total_price), 0))::float AS remaining,
        CASE
          WHEN b.amount = 0 THEN 0
-         ELSE ROUND((COALESCE(SUM(t.amount) FILTER (WHERE t.type = 'expense'), 0) / b.amount * 100)::numeric, 2)::float
+         ELSE ROUND((COALESCE(SUM(ti.total_price), 0) / b.amount * 100)::numeric, 2)::float
        END AS progress
      FROM budgets b
      JOIN categories c ON c.user_id = b.user_id AND c.id = b.category_id
      LEFT JOIN transactions t
        ON t.user_id = b.user_id
-       AND t.category_id = b.category_id
        AND date_trunc('month', t.transaction_date)::date = b.month
+       AND t.deleted = false
+     LEFT JOIN transaction_items ti
+       ON ti.user_id = t.user_id
+       AND ti.transaction_id = t.id
+       AND ti.category_id = b.category_id
      WHERE b.user_id = $1 AND b.month = $2
      GROUP BY b.id, c.id, c.name, c.sort_order
      ORDER BY c.sort_order, c.name`,

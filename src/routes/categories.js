@@ -89,7 +89,7 @@ categoriesRouter.delete('/:id', asyncHandler(async (req, res) => {
   const dependencies = await pool.query(
     `SELECT
        EXISTS(SELECT 1 FROM budgets WHERE user_id = $1 AND category_id = $2) AS has_budgets,
-       EXISTS(SELECT 1 FROM transactions WHERE user_id = $1 AND category_id = $2) AS has_transactions`,
+       EXISTS(SELECT 1 FROM transaction_items WHERE user_id = $1 AND category_id = $2) AS has_transactions`,
     [req.user.id, id]
   );
 
