@@ -15,12 +15,14 @@ export const transactionsRouter = Router();
 const transactionSelect = `
   t.id,
   to_char(t.transaction_date, 'YYYY-MM-DD') AS date,
-  t.paid_by AS "paidBy",
-  t.paid_to AS "paidTo",
+  t.paid_by_account_id AS "paidByAccountId",
+  t.paid_to_account_id AS "paidToAccountId",
+  COALESCE(paid_by_account.name, t.paid_by) AS "paidBy",
+  COALESCE(paid_to_account.name, t.paid_to) AS "paidTo",
   t.ticket_code AS ticket,
   t.ticket_link AS "ticketLink",
   t.currency,
-  t.total_amount::float AS amount,
+  COALESCE(SUM(ti.total_price), 0)::float AS amount,
   t.notes,
   to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
   to_char(t.updated_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "updatedAt",
@@ -77,10 +79,12 @@ transactionsRouter.get('/', asyncHandler(async (req, res) => {
   const result = await pool.query(
     `SELECT ${transactionSelect}
      FROM transactions t
+     LEFT JOIN accounts paid_by_account ON paid_by_account.user_id = t.user_id AND paid_by_account.id = t.paid_by_account_id
+     LEFT JOIN accounts paid_to_account ON paid_to_account.user_id = t.user_id AND paid_to_account.id = t.paid_to_account_id
      LEFT JOIN transaction_items ti ON ti.user_id = t.user_id AND ti.transaction_id = t.id
      LEFT JOIN categories c ON c.user_id = ti.user_id AND c.id = ti.category_id
      WHERE ${filters.join(' AND ')}
-     GROUP BY t.id
+     GROUP BY t.id, paid_by_account.name, paid_to_account.name
      ORDER BY t.transaction_date DESC, t.created_at DESC`,
     values
   );
@@ -95,21 +99,23 @@ transactionsRouter.post('/', asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
     await ensureCategories(client, req.user.id, transaction.items.map((item) => item.categoryId));
+    const paidByAccount = await ensureAccount(client, req.user.id, transaction.paidBy);
+    const paidToAccount = await ensureAccount(client, req.user.id, transaction.paidTo);
 
-    const total = sumItems(transaction.items);
     const created = await client.query(
-      `INSERT INTO transactions (user_id, transaction_date, paid_by, paid_to, ticket_code, ticket_link, currency, total_amount, notes, created_by_user_id, updated_by_user_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $1, $1)
+      `INSERT INTO transactions (user_id, transaction_date, paid_by_account_id, paid_to_account_id, paid_by, paid_to, ticket_code, ticket_link, currency, notes, created_by_user_id, updated_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $1, $1)
        RETURNING id`,
       [
         req.user.id,
         transaction.date,
-        transaction.paidBy,
-        transaction.paidTo,
+        paidByAccount.id,
+        paidToAccount.id,
+        paidByAccount.name,
+        paidToAccount.name,
         transaction.ticket,
         transaction.ticketLink,
         transaction.currency,
-        total,
         transaction.notes,
       ]
     );
@@ -138,14 +144,8 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
     values.push(requireDate(req.body.date));
     updates.push(`transaction_date = $${values.length}`);
   }
-  if (req.body.paidBy !== undefined) {
-    values.push(requireText(req.body.paidBy, 'paidBy'));
-    updates.push(`paid_by = $${values.length}`);
-  }
-  if (req.body.paidTo !== undefined) {
-    values.push(requireText(req.body.paidTo, 'paidTo'));
-    updates.push(`paid_to = $${values.length}`);
-  }
+  const paidByName = req.body.paidBy !== undefined ? requireText(req.body.paidBy, 'paidBy') : undefined;
+  const paidToName = req.body.paidTo !== undefined ? requireText(req.body.paidTo, 'paidTo') : undefined;
   if (req.body.ticket !== undefined) {
     values.push(optionalText(req.body.ticket, 'ticket'));
     updates.push(`ticket_code = $${values.length}`);
@@ -162,15 +162,11 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
     values.push(req.body.notes ? optionalText(req.body.notes, 'notes') : null);
     updates.push(`notes = $${values.length}`);
   }
-  if (hasItems) {
-    values.push(sumItems(items));
-    updates.push(`total_amount = $${values.length}`);
-  }
   values.push(req.user.id);
   updates.push(`updated_by_user_id = $${values.length}`);
   updates.push('updated_at = now()');
 
-  if (updates.length === 2 && !hasItems) {
+  if (updates.length === 2 && !hasItems && paidByName === undefined && paidToName === undefined) {
     throw new ApiError(400, 'VALIDATION_ERROR', 'No valid fields to update');
   }
 
@@ -181,6 +177,21 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
       await ensureCategories(client, req.user.id, items.map((item) => item.categoryId));
       await client.query('DELETE FROM transaction_items WHERE user_id = $1 AND transaction_id = $2', [req.user.id, id]);
       await insertItems(client, req.user.id, id, items);
+    }
+
+    if (paidByName !== undefined) {
+      const paidByAccount = await ensureAccount(client, req.user.id, paidByName);
+      values.push(paidByAccount.id);
+      updates.push(`paid_by_account_id = $${values.length}`);
+      values.push(paidByAccount.name);
+      updates.push(`paid_by = $${values.length}`);
+    }
+    if (paidToName !== undefined) {
+      const paidToAccount = await ensureAccount(client, req.user.id, paidToName);
+      values.push(paidToAccount.id);
+      updates.push(`paid_to_account_id = $${values.length}`);
+      values.push(paidToAccount.name);
+      updates.push(`paid_to = $${values.length}`);
     }
 
     if (updates.length > 0) {
@@ -245,8 +256,8 @@ function normalizeItems(items) {
   }
 
   return items.map((item, index) => {
-    const units = requireFiniteNumber(item.units, `items[${index}].units`);
-    const unitPrice = requireFiniteNumber(item.unitPrice, `items[${index}].unitPrice`);
+    const units = requireQuantity(item.units, `items[${index}].units`);
+    const unitPrice = requireMoneyNumber(item.unitPrice, `items[${index}].unitPrice`);
     const totalPrice = roundMoney(units * unitPrice);
 
     if (totalPrice === 0) {
@@ -263,16 +274,21 @@ function normalizeItems(items) {
   });
 }
 
-function requireFiniteNumber(value, field) {
+function requireQuantity(value, field) {
+  const parsed = requireNumber(value, field);
+  return Math.round(parsed * 1000000) / 1000000;
+}
+
+function requireMoneyNumber(value, field) {
+  return roundMoney(requireNumber(value, field));
+}
+
+function requireNumber(value, field) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) {
     throw new ApiError(400, 'VALIDATION_ERROR', `${field} must be a number`, { field });
   }
-  return roundMoney(parsed);
-}
-
-function sumItems(items) {
-  return roundMoney(items.reduce((sum, item) => sum + item.totalPrice, 0));
+  return parsed;
 }
 
 function roundMoney(value) {
@@ -291,6 +307,18 @@ async function ensureCategories(client, userId, categoryIds) {
   }
 }
 
+async function ensureAccount(client, userId, name) {
+  const result = await client.query(
+    `INSERT INTO accounts (user_id, name)
+     VALUES ($1, $2)
+     ON CONFLICT (user_id, name) DO UPDATE SET name = EXCLUDED.name
+     RETURNING id, name`,
+    [userId, requireText(name, 'account')]
+  );
+
+  return result.rows[0];
+}
+
 async function insertItems(client, userId, transactionId, items) {
   for (const item of items) {
     await client.query(
@@ -305,10 +333,12 @@ async function findTransaction(userId, id) {
   const result = await pool.query(
     `SELECT ${transactionSelect}
      FROM transactions t
+     LEFT JOIN accounts paid_by_account ON paid_by_account.user_id = t.user_id AND paid_by_account.id = t.paid_by_account_id
+     LEFT JOIN accounts paid_to_account ON paid_to_account.user_id = t.user_id AND paid_to_account.id = t.paid_to_account_id
      LEFT JOIN transaction_items ti ON ti.user_id = t.user_id AND ti.transaction_id = t.id
      LEFT JOIN categories c ON c.user_id = ti.user_id AND c.id = ti.category_id
      WHERE t.user_id = $1 AND t.id = $2 AND t.deleted = false
-     GROUP BY t.id`,
+     GROUP BY t.id, paid_by_account.name, paid_to_account.name`,
     [userId, id]
   );
 

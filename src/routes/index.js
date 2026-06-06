@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { accountsRouter } from './accounts.js';
 import { authRouter } from './auth.js';
 import { budgetsRouter } from './budgets.js';
 import { categoriesRouter } from './categories.js';
@@ -12,6 +13,7 @@ router.get('/health', (req, res) => {
 });
 
 router.use('/auth', authRouter);
+router.use('/accounts', accountsRouter);
 router.use('/categories', categoriesRouter);
 router.use('/budgets', budgetsRouter);
 router.use('/transactions', transactionsRouter);
