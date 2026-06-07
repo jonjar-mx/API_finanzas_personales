@@ -22,6 +22,7 @@ const transactionSelect = `
   t.ticket_code AS ticket,
   t.ticket_link AS "ticketLink",
   t.currency,
+  t.transaction_type AS "transactionType",
   COALESCE(SUM(ti.total_price), 0)::float AS amount,
   t.notes,
   to_char(t.created_at, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS "createdAt",
@@ -75,6 +76,10 @@ transactionsRouter.get('/', asyncHandler(async (req, res) => {
     values.push(optionalDate(req.query.to, 'to'));
     filters.push(`t.transaction_date <= $${values.length}`);
   }
+  if (req.query.transactionType || req.query.type) {
+    values.push(requireTransactionType(req.query.transactionType || req.query.type));
+    filters.push(`t.transaction_type = $${values.length}`);
+  }
 
   const result = await pool.query(
     `SELECT ${transactionSelect}
@@ -101,10 +106,12 @@ transactionsRouter.post('/', asyncHandler(async (req, res) => {
     await ensureCategories(client, req.user.id, transaction.items.map((item) => item.categoryId));
     const paidByAccount = await ensureAccount(client, req.user.id, transaction.paidBy);
     const paidToAccount = await ensureAccount(client, req.user.id, transaction.paidTo);
+    const transactionType = transaction.transactionType
+      || inferTransactionType(paidByAccount, paidToAccount, transaction.items);
 
     const created = await client.query(
-      `INSERT INTO transactions (user_id, transaction_date, paid_by_account_id, paid_to_account_id, paid_by, paid_to, ticket_code, ticket_link, currency, notes, created_by_user_id, updated_by_user_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $1, $1)
+      `INSERT INTO transactions (user_id, transaction_date, paid_by_account_id, paid_to_account_id, paid_by, paid_to, ticket_code, ticket_link, currency, transaction_type, notes, created_by_user_id, updated_by_user_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $1)
        RETURNING id`,
       [
         req.user.id,
@@ -116,6 +123,7 @@ transactionsRouter.post('/', asyncHandler(async (req, res) => {
         transaction.ticket,
         transaction.ticketLink,
         transaction.currency,
+        transactionType,
         transaction.notes,
       ]
     );
@@ -146,6 +154,9 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
   }
   const paidByName = req.body.paidBy !== undefined ? requireText(req.body.paidBy, 'paidBy') : undefined;
   const paidToName = req.body.paidTo !== undefined ? requireText(req.body.paidTo, 'paidTo') : undefined;
+  const transactionType = req.body.transactionType !== undefined || req.body.type !== undefined
+    ? requireTransactionType(req.body.transactionType || req.body.type)
+    : undefined;
   if (req.body.ticket !== undefined) {
     values.push(optionalText(req.body.ticket, 'ticket'));
     updates.push(`ticket_code = $${values.length}`);
@@ -166,12 +177,17 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
   updates.push(`updated_by_user_id = $${values.length}`);
   updates.push('updated_at = now()');
 
-  if (updates.length === 2 && !hasItems && paidByName === undefined && paidToName === undefined) {
+  if (updates.length === 2 && !hasItems && paidByName === undefined && paidToName === undefined && transactionType === undefined) {
     throw new ApiError(400, 'VALIDATION_ERROR', 'No valid fields to update');
   }
 
   try {
     await client.query('BEGIN');
+
+    const existing = await getTransactionForTypeInference(client, req.user.id, id);
+    if (!existing) {
+      throw new ApiError(404, 'NOT_FOUND', 'Transaction not found');
+    }
 
     if (hasItems) {
       await ensureCategories(client, req.user.id, items.map((item) => item.categoryId));
@@ -179,19 +195,26 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
       await insertItems(client, req.user.id, id, items);
     }
 
+    let paidByAccount = existing.paidByAccount;
+    let paidToAccount = existing.paidToAccount;
+
     if (paidByName !== undefined) {
-      const paidByAccount = await ensureAccount(client, req.user.id, paidByName);
+      paidByAccount = await ensureAccount(client, req.user.id, paidByName);
       values.push(paidByAccount.id);
       updates.push(`paid_by_account_id = $${values.length}`);
       values.push(paidByAccount.name);
       updates.push(`paid_by = $${values.length}`);
     }
     if (paidToName !== undefined) {
-      const paidToAccount = await ensureAccount(client, req.user.id, paidToName);
+      paidToAccount = await ensureAccount(client, req.user.id, paidToName);
       values.push(paidToAccount.id);
       updates.push(`paid_to_account_id = $${values.length}`);
       values.push(paidToAccount.name);
       updates.push(`paid_to = $${values.length}`);
+    }
+    if (transactionType !== undefined || paidByName !== undefined || paidToName !== undefined || hasItems) {
+      values.push(transactionType || inferTransactionType(paidByAccount, paidToAccount, items || existing.items));
+      updates.push(`transaction_type = $${values.length}`);
     }
 
     if (updates.length > 0) {
@@ -246,8 +269,19 @@ function normalizeTransaction(body) {
     ticketLink: body.ticketLink ? optionalText(body.ticketLink, 'ticketLink') : null,
     currency: requireText(body.currency || '$MX', 'currency'),
     notes: body.notes ? optionalText(body.notes, 'notes') : null,
+    transactionType: body.transactionType !== undefined || body.type !== undefined
+      ? requireTransactionType(body.transactionType || body.type)
+      : null,
     items: normalizeItems(body.items),
   };
+}
+
+function requireTransactionType(value) {
+  const allowed = new Set(['expense', 'income', 'transfer', 'credit_payment']);
+  if (typeof value !== 'string' || !allowed.has(value)) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'transactionType must be a valid transaction type', { field: 'transactionType' });
+  }
+  return value;
 }
 
 function normalizeItems(items) {
@@ -312,11 +346,49 @@ async function ensureAccount(client, userId, name) {
     `INSERT INTO accounts (user_id, name)
      VALUES ($1, $2)
      ON CONFLICT (user_id, name) DO UPDATE SET name = EXCLUDED.name
-     RETURNING id, name`,
+     RETURNING id, name, is_own AS "isOwn", account_type AS "accountType"`,
     [userId, requireText(name, 'account')]
   );
 
   return result.rows[0];
+}
+
+async function getTransactionForTypeInference(client, userId, id) {
+  const result = await client.query(
+    `SELECT
+       t.id,
+       json_build_object('id', paid_by_account.id, 'name', paid_by_account.name, 'isOwn', paid_by_account.is_own, 'accountType', paid_by_account.account_type) AS "paidByAccount",
+       json_build_object('id', paid_to_account.id, 'name', paid_to_account.name, 'isOwn', paid_to_account.is_own, 'accountType', paid_to_account.account_type) AS "paidToAccount",
+       COALESCE(
+         json_agg(
+           json_build_object('categoryId', ti.category_id, 'category', c.name)
+         ) FILTER (WHERE ti.id IS NOT NULL),
+         '[]'::json
+       ) AS items
+     FROM transactions t
+     LEFT JOIN accounts paid_by_account ON paid_by_account.user_id = t.user_id AND paid_by_account.id = t.paid_by_account_id
+     LEFT JOIN accounts paid_to_account ON paid_to_account.user_id = t.user_id AND paid_to_account.id = t.paid_to_account_id
+     LEFT JOIN transaction_items ti ON ti.user_id = t.user_id AND ti.transaction_id = t.id
+     LEFT JOIN categories c ON c.user_id = ti.user_id AND c.id = ti.category_id
+     WHERE t.user_id = $1 AND t.id = $2 AND t.deleted = false
+     GROUP BY t.id, paid_by_account.id, paid_by_account.name, paid_by_account.is_own, paid_by_account.account_type, paid_to_account.id, paid_to_account.name, paid_to_account.is_own, paid_to_account.account_type`,
+    [userId, id]
+  );
+
+  return result.rows[0] || null;
+}
+
+function inferTransactionType(paidByAccount, paidToAccount, items) {
+  if (paidByAccount?.isOwn && paidToAccount?.isOwn) {
+    return ['credit_card', 'loan'].includes(paidToAccount.accountType) ? 'credit_payment' : 'transfer';
+  }
+  if (paidToAccount?.isOwn && !paidByAccount?.isOwn) {
+    return 'income';
+  }
+  if (items.some((item) => String(item.category || '').trim().toLowerCase() === 'ingreso')) {
+    return 'income';
+  }
+  return 'expense';
 }
 
 async function insertItems(client, userId, transactionId, items) {
@@ -356,6 +428,6 @@ function withSummaryFields(transaction) {
     description: transaction.ticket || transaction.paidTo,
     categoryId: firstItem?.categoryId || null,
     category: firstItem?.category || 'Multiple',
-    type: transaction.items.some((item) => item.category === 'ingreso') ? 'income' : 'expense',
+    type: transaction.transactionType,
   };
 }

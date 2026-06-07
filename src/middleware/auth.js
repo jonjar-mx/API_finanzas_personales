@@ -5,7 +5,8 @@ import { verifySessionToken } from '../utils/tokens.js';
 const publicRoutes = new Set([
   'GET /health',
   'POST /auth/login',
-  'POST /auth/register'
+  'POST /auth/register',
+  'POST /auth/forgot-password'
 ]);
 
 export async function attachUser(req, res, next) {

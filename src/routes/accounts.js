@@ -5,6 +5,9 @@ import { optionalText, requireAmount, requireText, requireUuid } from '../utils/
 
 export const accountsRouter = Router();
 
+const accountTypes = new Set(['cash', 'bank', 'credit_card', 'loan', 'investment', 'external']);
+const liquidAccountTypes = new Set(['cash', 'bank']);
+
 const selectColumns = `
   id,
   name,
@@ -14,7 +17,9 @@ const selectColumns = `
   email,
   is_own AS "isOwn",
   is_credit AS "isCredit",
-  credit_limit::float AS "creditLimit"
+  credit_limit::float AS "creditLimit",
+  account_type AS "accountType",
+  is_liquid AS "isLiquid"
 `;
 
 accountsRouter.get('/', asyncHandler(async (req, res) => {
@@ -22,7 +27,7 @@ accountsRouter.get('/', asyncHandler(async (req, res) => {
     `SELECT ${selectColumns}
      FROM accounts
      WHERE user_id = $1
-     ORDER BY is_own DESC, name`,
+     ORDER BY is_own DESC, account_type, name`,
     [req.user.id]
   );
 
@@ -32,8 +37,8 @@ accountsRouter.get('/', asyncHandler(async (req, res) => {
 accountsRouter.post('/', asyncHandler(async (req, res) => {
   const account = normalizeAccount(req.body);
   const result = await pool.query(
-    `INSERT INTO accounts (user_id, name, business_name, address, phone, email, is_own, is_credit, credit_limit)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    `INSERT INTO accounts (user_id, name, business_name, address, phone, email, is_own, is_credit, credit_limit, account_type, is_liquid)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (user_id, name) DO UPDATE
        SET business_name = COALESCE(EXCLUDED.business_name, accounts.business_name),
            address = COALESCE(EXCLUDED.address, accounts.address),
@@ -41,9 +46,11 @@ accountsRouter.post('/', asyncHandler(async (req, res) => {
            email = COALESCE(EXCLUDED.email, accounts.email),
            is_own = EXCLUDED.is_own,
            is_credit = EXCLUDED.is_credit,
-           credit_limit = EXCLUDED.credit_limit
+           credit_limit = EXCLUDED.credit_limit,
+           account_type = EXCLUDED.account_type,
+           is_liquid = EXCLUDED.is_liquid
      RETURNING ${selectColumns}`,
-    [req.user.id, account.name, account.businessName, account.address, account.phone, account.email, account.isOwn, account.isCredit, account.creditLimit]
+    [req.user.id, account.name, account.businessName, account.address, account.phone, account.email, account.isOwn, account.isCredit, account.creditLimit, account.accountType, account.isLiquid]
   );
 
   res.status(201).json(result.rows[0]);
@@ -53,6 +60,7 @@ accountsRouter.patch('/:id', asyncHandler(async (req, res) => {
   const id = requireUuid(req.params.id);
   const updates = [];
   const values = [req.user.id, id];
+  const normalized = normalizeAccountUpdate(req.body);
 
   if (req.body.name !== undefined) {
     values.push(requireText(req.body.name, 'name'));
@@ -74,23 +82,25 @@ accountsRouter.patch('/:id', asyncHandler(async (req, res) => {
     values.push(req.body.email ? optionalText(req.body.email, 'email') : null);
     updates.push(`email = $${values.length}`);
   }
-  if (req.body.isOwn !== undefined) {
-    if (typeof req.body.isOwn !== 'boolean') {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'isOwn must be a boolean', { field: 'isOwn' });
-    }
-    values.push(req.body.isOwn);
+  if (normalized.isOwn !== undefined) {
+    values.push(normalized.isOwn);
     updates.push(`is_own = $${values.length}`);
   }
-  if (req.body.isCredit !== undefined) {
-    if (typeof req.body.isCredit !== 'boolean') {
-      throw new ApiError(400, 'VALIDATION_ERROR', 'isCredit must be a boolean', { field: 'isCredit' });
-    }
-    values.push(req.body.isCredit);
+  if (normalized.isCredit !== undefined) {
+    values.push(normalized.isCredit);
     updates.push(`is_credit = $${values.length}`);
   }
-  if (req.body.creditLimit !== undefined) {
-    values.push(requireAmount(req.body.creditLimit || 0, { field: 'creditLimit', allowZero: true }));
+  if (normalized.creditLimit !== undefined) {
+    values.push(normalized.creditLimit);
     updates.push(`credit_limit = $${values.length}`);
+  }
+  if (normalized.accountType !== undefined) {
+    values.push(normalized.accountType);
+    updates.push(`account_type = $${values.length}`);
+  }
+  if (normalized.isLiquid !== undefined) {
+    values.push(normalized.isLiquid);
+    updates.push(`is_liquid = $${values.length}`);
   }
 
   if (updates.length === 0) {
@@ -113,14 +123,7 @@ accountsRouter.patch('/:id', asyncHandler(async (req, res) => {
 }));
 
 function normalizeAccount(body) {
-  if (body.isOwn !== undefined && typeof body.isOwn !== 'boolean') {
-    throw new ApiError(400, 'VALIDATION_ERROR', 'isOwn must be a boolean', { field: 'isOwn' });
-  }
-  if (body.isCredit !== undefined && typeof body.isCredit !== 'boolean') {
-    throw new ApiError(400, 'VALIDATION_ERROR', 'isCredit must be a boolean', { field: 'isCredit' });
-  }
-
-  const isCredit = body.isCredit === true;
+  const normalized = normalizeAccountUpdate(body);
 
   return {
     name: requireText(body.name, 'name'),
@@ -128,8 +131,49 @@ function normalizeAccount(body) {
     address: body.address ? optionalText(body.address, 'address') : null,
     phone: body.phone ? optionalText(body.phone, 'phone') : null,
     email: body.email ? optionalText(body.email, 'email') : null,
-    isOwn: body.isOwn === true,
-    isCredit,
-    creditLimit: requireAmount(isCredit ? (body.creditLimit || 0) : 0, { field: 'creditLimit', allowZero: true }),
+    isOwn: normalized.isOwn === true,
+    isCredit: normalized.isCredit === true,
+    creditLimit: normalized.creditLimit ?? 0,
+    accountType: normalized.accountType || 'bank',
+    isLiquid: normalized.isLiquid ?? liquidAccountTypes.has(normalized.accountType || 'bank'),
   };
+}
+
+function normalizeAccountUpdate(body) {
+  const accountType = body.accountType !== undefined ? requireAccountType(body.accountType) : inferAccountType(body);
+  const isCredit = accountType !== undefined ? accountType === 'credit_card' : requireOptionalBoolean(body.isCredit, 'isCredit');
+  const creditLimit = body.creditLimit !== undefined || isCredit !== undefined
+    ? requireAmount(isCredit ? (body.creditLimit || 0) : 0, { field: 'creditLimit', allowZero: true })
+    : undefined;
+
+  return {
+    isOwn: requireOptionalBoolean(body.isOwn, 'isOwn'),
+    isCredit,
+    creditLimit,
+    accountType,
+    isLiquid: body.isLiquid !== undefined
+      ? requireOptionalBoolean(body.isLiquid, 'isLiquid')
+      : accountType !== undefined ? liquidAccountTypes.has(accountType) : undefined,
+  };
+}
+
+function inferAccountType(body) {
+  if (body.isCredit === true) return 'credit_card';
+  if (body.isOwn === false) return 'external';
+  return undefined;
+}
+
+function requireAccountType(value) {
+  if (typeof value !== 'string' || !accountTypes.has(value)) {
+    throw new ApiError(400, 'VALIDATION_ERROR', 'accountType must be a valid account type', { field: 'accountType' });
+  }
+  return value;
+}
+
+function requireOptionalBoolean(value, field) {
+  if (value === undefined) return undefined;
+  if (typeof value !== 'boolean') {
+    throw new ApiError(400, 'VALIDATION_ERROR', field + ' must be a boolean', { field });
+  }
+  return value;
 }

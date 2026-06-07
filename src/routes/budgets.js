@@ -23,7 +23,8 @@ const listQuery = `
   LEFT JOIN transactions t
     ON t.user_id = b.user_id
     AND date_trunc('month', t.transaction_date)::date = b.month
-       AND t.deleted = false
+    AND t.deleted = false
+    AND t.transaction_type = 'expense'
   LEFT JOIN transaction_items ti
     ON ti.user_id = t.user_id
     AND ti.transaction_id = t.id
