@@ -5,7 +5,10 @@ dotenv.config();
 const defaultCorsOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
-  'http://192.168.1.231:3000'
+  'http://localhost:4173',
+  'http://127.0.0.1:4173',
+  'http://192.168.1.231:3000',
+  'http://192.168.1.231:4173'
 ];
 
 function parseCorsOrigins(value) {
