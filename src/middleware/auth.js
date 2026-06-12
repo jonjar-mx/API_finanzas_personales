@@ -1,6 +1,7 @@
 import { pool } from '../db/pool.js';
 import { ApiError } from '../utils/errors.js';
 import { verifySessionToken } from '../utils/tokens.js';
+import { attachSubscription } from '../billing/tiers.js';
 
 const publicRoutes = new Set([
   'GET /health',
@@ -23,16 +24,37 @@ export async function attachUser(req, res, next) {
 
     const claims = verifySessionToken(token);
     const result = await pool.query(
-      'SELECT id, email, display_name AS "displayName" FROM users WHERE id = $1',
+      `SELECT id,
+              email,
+              display_name AS "displayName",
+              role,
+              status,
+              plan_tier AS "planTier",
+              plan_changed_at AS "planChangedAt",
+              free_grace_started_at AS "freeGraceStartedAt"
+       FROM users
+       WHERE id = $1`,
       [claims.sub]
     );
     if (result.rowCount === 0) {
       throw new ApiError(401, 'UNAUTHORIZED', 'Session user does not exist');
     }
 
-    req.user = result.rows[0];
+    const user = result.rows[0];
+    if (user.status !== 'active') {
+      throw new ApiError(403, 'FORBIDDEN', 'User account is disabled');
+    }
+
+    req.user = attachSubscription(user);
     return next();
   } catch (err) {
     return next(err);
   }
+}
+
+export function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return next(new ApiError(403, 'FORBIDDEN', 'Admin access is required'));
+  }
+  return next();
 }

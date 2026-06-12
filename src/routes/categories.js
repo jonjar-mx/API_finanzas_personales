@@ -6,19 +6,29 @@ import { optionalColor, optionalText, requireText, requireUuid } from '../utils/
 export const categoriesRouter = Router();
 
 const selectColumns = `
-  id,
-  name,
-  color,
-  icon,
-  sort_order AS "sortOrder"
+  c.id,
+  c.user_id AS "ownerUserId",
+  owner.email AS "ownerEmail",
+  c.name,
+  c.color,
+  c.icon,
+  c.sort_order AS "sortOrder"
 `;
 
 categoriesRouter.get('/', asyncHandler(async (req, res) => {
   const result = await pool.query(
-    `SELECT ${selectColumns}
-     FROM categories
-     WHERE user_id = $1
-     ORDER BY sort_order, name`,
+    `SELECT DISTINCT ${selectColumns}
+     FROM categories c
+     JOIN users owner ON owner.id = c.user_id
+     WHERE c.user_id = $1
+        OR EXISTS (
+          SELECT 1
+          FROM accounts a
+          JOIN account_members am ON am.account_id = a.id
+          WHERE a.user_id = c.user_id
+            AND am.user_id = $1
+        )
+     ORDER BY c.sort_order, c.name`,
     [req.user.id]
   );
 
@@ -34,7 +44,7 @@ categoriesRouter.post('/', asyncHandler(async (req, res) => {
   const result = await pool.query(
     `INSERT INTO categories (user_id, name, color, icon, sort_order)
      VALUES ($1, $2, $3, $4, $5)
-     RETURNING ${selectColumns}`,
+     RETURNING id, user_id AS "ownerUserId", name, color, icon, sort_order AS "sortOrder"`,
     [req.user.id, name, color, icon, sortOrder]
   );
 
@@ -73,7 +83,7 @@ categoriesRouter.patch('/:id', asyncHandler(async (req, res) => {
     `UPDATE categories
      SET ${updates.join(', ')}
      WHERE user_id = $1 AND id = $2
-     RETURNING ${selectColumns}`,
+     RETURNING id, user_id AS "ownerUserId", name, color, icon, sort_order AS "sortOrder"`,
     values
   );
 

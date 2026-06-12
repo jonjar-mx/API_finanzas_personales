@@ -5,8 +5,12 @@ dotenv.config();
 const defaultCorsOrigins = [
   'http://localhost:3000',
   'http://127.0.0.1:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3001',
   'http://localhost:4173',
   'http://127.0.0.1:4173',
+  'http://localhost:4174',
+  'http://127.0.0.1:4174',
   'http://192.168.1.231:3000',
   'http://192.168.1.231:4173'
 ];
@@ -30,6 +34,10 @@ export const config = {
   corsOrigins: parseCorsOrigins(process.env.CORS_ORIGINS),
   authSecret: process.env.AUTH_SECRET || 'dev-finanzas-auth-secret-change-me',
   sessionTtlSeconds: Number(process.env.SESSION_TTL_SECONDS || 60 * 60 * 24 * 7),
+  freeTierRetention: {
+    enabled: process.env.FREE_TIER_RETENTION_ENABLED !== 'false',
+    runAtUtc: process.env.FREE_TIER_RETENTION_RUN_AT_UTC || '03:20'
+  },
   smtp: {
     host: process.env.SMTP_HOST || '',
     port: Number(process.env.SMTP_PORT || 587),

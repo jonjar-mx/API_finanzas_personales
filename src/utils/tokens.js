@@ -16,23 +16,32 @@ function sign(value) {
 
 export function createSessionToken(user) {
   const now = Math.floor(Date.now() / 1000);
+  const header = encode({ alg: 'HS256', typ: 'JWT' });
   const payload = encode({
     sub: user.id,
     email: user.email,
-    name: user.display_name,
+    name: user.display_name || user.displayName,
+    role: user.role || 'user',
     iat: now,
     exp: now + config.sessionTtlSeconds
   });
-  return `${payload}.${sign(payload)}`;
+  const unsignedToken = `${header}.${payload}`;
+  return `${unsignedToken}.${sign(unsignedToken)}`;
 }
 
 export function verifySessionToken(token) {
-  const [payload, signature] = String(token || '').split('.');
-  if (!payload || !signature) {
+  const [header, payload, signature] = String(token || '').split('.');
+  if (!header || !payload || !signature) {
     throw new ApiError(401, 'UNAUTHORIZED', 'Invalid session token');
   }
 
-  const expectedSignature = sign(payload);
+  const decodedHeader = decode(header);
+  if (decodedHeader.alg !== 'HS256' || decodedHeader.typ !== 'JWT') {
+    throw new ApiError(401, 'UNAUTHORIZED', 'Invalid session token');
+  }
+
+  const unsignedToken = `${header}.${payload}`;
+  const expectedSignature = sign(unsignedToken);
   const expected = Buffer.from(expectedSignature);
   const actual = Buffer.from(signature);
   if (expected.length !== actual.length || !crypto.timingSafeEqual(expected, actual)) {

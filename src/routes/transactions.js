@@ -51,7 +51,12 @@ const transactionSelect = `
 
 transactionsRouter.get('/', asyncHandler(async (req, res) => {
   const values = [req.user.id];
-  const filters = ['t.user_id = $1'];
+  const filters = [`EXISTS (
+    SELECT 1
+    FROM account_members am
+    WHERE am.user_id = $1
+      AND am.account_id IN (t.paid_by_account_id, t.paid_to_account_id)
+  )`];
 
   if (req.query.includeDeleted !== 'true') {
     filters.push('t.deleted = false');
@@ -84,8 +89,8 @@ transactionsRouter.get('/', asyncHandler(async (req, res) => {
   const result = await pool.query(
     `SELECT ${transactionSelect}
      FROM transactions t
-     LEFT JOIN accounts paid_by_account ON paid_by_account.user_id = t.user_id AND paid_by_account.id = t.paid_by_account_id
-     LEFT JOIN accounts paid_to_account ON paid_to_account.user_id = t.user_id AND paid_to_account.id = t.paid_to_account_id
+     LEFT JOIN accounts paid_by_account ON paid_by_account.id = t.paid_by_account_id
+     LEFT JOIN accounts paid_to_account ON paid_to_account.id = t.paid_to_account_id
      LEFT JOIN transaction_items ti ON ti.user_id = t.user_id AND ti.transaction_id = t.id
      LEFT JOIN categories c ON c.user_id = ti.user_id AND c.id = ti.category_id
      WHERE ${filters.join(' AND ')}
@@ -103,18 +108,19 @@ transactionsRouter.post('/', asyncHandler(async (req, res) => {
 
   try {
     await client.query('BEGIN');
-    await ensureCategories(client, req.user.id, transaction.items.map((item) => item.categoryId));
-    const paidByAccount = await ensureAccount(client, req.user.id, transaction.paidBy);
-    const paidToAccount = await ensureAccount(client, req.user.id, transaction.paidTo);
+    const ledgerUserId = await resolveLedgerUserId(client, req.user.id, [transaction.paidBy, transaction.paidTo], 'create');
+    await ensureCategories(client, ledgerUserId, transaction.items.map((item) => item.categoryId));
+    const paidByAccount = await ensureAccount(client, req.user.id, ledgerUserId, transaction.paidBy);
+    const paidToAccount = await ensureAccount(client, req.user.id, ledgerUserId, transaction.paidTo);
     const transactionType = transaction.transactionType
       || inferTransactionType(paidByAccount, paidToAccount, transaction.items);
 
     const created = await client.query(
       `INSERT INTO transactions (user_id, transaction_date, paid_by_account_id, paid_to_account_id, paid_by, paid_to, ticket_code, ticket_link, currency, transaction_type, notes, created_by_user_id, updated_by_user_id)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $1, $1)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)
        RETURNING id`,
       [
-        req.user.id,
+        ledgerUserId,
         transaction.date,
         paidByAccount.id,
         paidToAccount.id,
@@ -125,10 +131,11 @@ transactionsRouter.post('/', asyncHandler(async (req, res) => {
         transaction.currency,
         transactionType,
         transaction.notes,
+        req.user.id,
       ]
     );
 
-    await insertItems(client, req.user.id, created.rows[0].id, transaction.items);
+    await insertItems(client, ledgerUserId, created.rows[0].id, transaction.items);
     await client.query('COMMIT');
 
     res.status(201).json(await findTransaction(req.user.id, created.rows[0].id));
@@ -143,7 +150,7 @@ transactionsRouter.post('/', asyncHandler(async (req, res) => {
 transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
   const id = requireUuid(req.params.id);
   const updates = [];
-  const values = [req.user.id, id];
+  const values = [id, null];
   const hasItems = req.body.items !== undefined;
   const items = hasItems ? normalizeItems(req.body.items) : null;
   const client = await pool.connect();
@@ -184,29 +191,31 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
   try {
     await client.query('BEGIN');
 
-    const existing = await getTransactionForTypeInference(client, req.user.id, id);
+    const existing = await getTransactionForTypeInference(client, req.user.id, id, 'manage');
     if (!existing) {
       throw new ApiError(404, 'NOT_FOUND', 'Transaction not found');
     }
+    const ledgerUserId = existing.userId;
+    values[1] = ledgerUserId;
 
     if (hasItems) {
-      await ensureCategories(client, req.user.id, items.map((item) => item.categoryId));
-      await client.query('DELETE FROM transaction_items WHERE user_id = $1 AND transaction_id = $2', [req.user.id, id]);
-      await insertItems(client, req.user.id, id, items);
+      await ensureCategories(client, ledgerUserId, items.map((item) => item.categoryId));
+      await client.query('DELETE FROM transaction_items WHERE user_id = $1 AND transaction_id = $2', [ledgerUserId, id]);
+      await insertItems(client, ledgerUserId, id, items);
     }
 
     let paidByAccount = existing.paidByAccount;
     let paidToAccount = existing.paidToAccount;
 
     if (paidByName !== undefined) {
-      paidByAccount = await ensureAccount(client, req.user.id, paidByName);
+      paidByAccount = await ensureAccount(client, req.user.id, ledgerUserId, paidByName);
       values.push(paidByAccount.id);
       updates.push(`paid_by_account_id = $${values.length}`);
       values.push(paidByAccount.name);
       updates.push(`paid_by = $${values.length}`);
     }
     if (paidToName !== undefined) {
-      paidToAccount = await ensureAccount(client, req.user.id, paidToName);
+      paidToAccount = await ensureAccount(client, req.user.id, ledgerUserId, paidToName);
       values.push(paidToAccount.id);
       updates.push(`paid_to_account_id = $${values.length}`);
       values.push(paidToAccount.name);
@@ -221,7 +230,7 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
       const result = await client.query(
         `UPDATE transactions
          SET ${updates.join(', ')}
-         WHERE user_id = $1 AND id = $2 AND deleted = false
+         WHERE id = $1 AND user_id = $2 AND deleted = false
          RETURNING id`,
         values
       );
@@ -243,6 +252,11 @@ transactionsRouter.patch('/:id', asyncHandler(async (req, res) => {
 
 transactionsRouter.delete('/:id', asyncHandler(async (req, res) => {
   const id = requireUuid(req.params.id);
+  const existing = await getTransactionForTypeInference(pool, req.user.id, id, 'manage');
+  if (!existing) {
+    throw new ApiError(404, 'NOT_FOUND', 'Transaction not found');
+  }
+
   const result = await pool.query(
     `UPDATE transactions
      SET deleted = true,
@@ -250,9 +264,9 @@ transactionsRouter.delete('/:id', asyncHandler(async (req, res) => {
          deleted_by_user_id = $1,
          updated_by_user_id = $1,
          updated_at = now()
-     WHERE user_id = $1 AND id = $2 AND deleted = false
+     WHERE user_id = $2 AND id = $3 AND deleted = false
      RETURNING id`,
-    [req.user.id, id]
+    [req.user.id, existing.userId, id]
   );
   if (result.rowCount === 0) {
     throw new ApiError(404, 'NOT_FOUND', 'Transaction not found');
@@ -341,22 +355,81 @@ async function ensureCategories(client, userId, categoryIds) {
   }
 }
 
-async function ensureAccount(client, userId, name) {
+async function ensureAccount(client, actingUserId, ledgerUserId, name) {
+  const accountName = requireText(name, 'account');
+  const accessible = await client.query(
+    `SELECT a.id,
+            a.user_id AS "ownerUserId",
+            a.name,
+            a.is_own AS "isOwn",
+            a.account_type AS "accountType",
+            am.role AS "accessRole"
+     FROM accounts a
+     JOIN account_members am ON am.account_id = a.id AND am.user_id = $1
+     WHERE lower(a.name) = lower($2)
+     ORDER BY CASE WHEN a.user_id = $3 THEN 0 ELSE 1 END
+     LIMIT 1`,
+    [actingUserId, accountName, ledgerUserId]
+  );
+
+  const sharedAccount = accessible.rows[0];
+  if (sharedAccount) {
+    if (sharedAccount.ownerUserId !== ledgerUserId) {
+      throw new ApiError(409, 'CONFLICT', 'Transaction accounts must belong to the same shared ledger');
+    }
+    return sharedAccount;
+  }
+
   const result = await client.query(
     `INSERT INTO accounts (user_id, name)
      VALUES ($1, $2)
      ON CONFLICT (user_id, name) DO UPDATE SET name = EXCLUDED.name
-     RETURNING id, name, is_own AS "isOwn", account_type AS "accountType"`,
-    [userId, requireText(name, 'account')]
+     RETURNING id, user_id AS "ownerUserId", name, is_own AS "isOwn", account_type AS "accountType"`,
+    [ledgerUserId, accountName]
   );
 
-  return result.rows[0];
+  await client.query(
+    `INSERT INTO account_members (account_id, user_id, role, created_by_user_id)
+     VALUES ($1, $2, 'owner', $2)
+     ON CONFLICT (account_id, user_id) DO UPDATE SET role = 'owner'`,
+    [result.rows[0].id, ledgerUserId]
+  );
+
+  return { ...result.rows[0], accessRole: actingUserId === ledgerUserId ? 'owner' : 'expender' };
 }
 
-async function getTransactionForTypeInference(client, userId, id) {
+async function resolveLedgerUserId(client, actingUserId, accountNames, action) {
+  const result = await client.query(
+    `SELECT DISTINCT a.user_id AS "ownerUserId",
+            am.role
+     FROM accounts a
+     JOIN account_members am ON am.account_id = a.id AND am.user_id = $1
+     WHERE lower(a.name) = ANY($2::text[])`,
+    [actingUserId, accountNames.map((name) => requireText(name, 'account').toLowerCase())]
+  );
+
+  const memberships = result.rows;
+  if (memberships.length === 0) {
+    return actingUserId;
+  }
+  const ownerIds = [...new Set(memberships.map((row) => row.ownerUserId))];
+  if (ownerIds.length > 1) {
+    throw new ApiError(409, 'CONFLICT', 'Transaction accounts must belong to the same shared ledger');
+  }
+
+  const allowedRoles = action === 'create' ? new Set(['owner', 'admin', 'expender']) : new Set(['owner', 'admin']);
+  if (!memberships.some((row) => allowedRoles.has(row.role))) {
+    throw new ApiError(403, 'FORBIDDEN', 'Insufficient account permissions');
+  }
+  return ownerIds[0];
+}
+
+async function getTransactionForTypeInference(client, userId, id, permission = 'read') {
+  const allowedRoles = permission === 'manage' ? ['owner', 'admin'] : ['owner', 'admin', 'expender', 'reader'];
   const result = await client.query(
     `SELECT
        t.id,
+       t.user_id AS "userId",
        json_build_object('id', paid_by_account.id, 'name', paid_by_account.name, 'isOwn', paid_by_account.is_own, 'accountType', paid_by_account.account_type) AS "paidByAccount",
        json_build_object('id', paid_to_account.id, 'name', paid_to_account.name, 'isOwn', paid_to_account.is_own, 'accountType', paid_to_account.account_type) AS "paidToAccount",
        COALESCE(
@@ -366,13 +439,20 @@ async function getTransactionForTypeInference(client, userId, id) {
          '[]'::json
        ) AS items
      FROM transactions t
-     LEFT JOIN accounts paid_by_account ON paid_by_account.user_id = t.user_id AND paid_by_account.id = t.paid_by_account_id
-     LEFT JOIN accounts paid_to_account ON paid_to_account.user_id = t.user_id AND paid_to_account.id = t.paid_to_account_id
+     LEFT JOIN accounts paid_by_account ON paid_by_account.id = t.paid_by_account_id
+     LEFT JOIN accounts paid_to_account ON paid_to_account.id = t.paid_to_account_id
      LEFT JOIN transaction_items ti ON ti.user_id = t.user_id AND ti.transaction_id = t.id
      LEFT JOIN categories c ON c.user_id = ti.user_id AND c.id = ti.category_id
-     WHERE t.user_id = $1 AND t.id = $2 AND t.deleted = false
+     WHERE t.id = $1 AND t.deleted = false
+       AND EXISTS (
+         SELECT 1
+         FROM account_members am
+         WHERE am.user_id = $2
+           AND am.role = ANY($3::text[])
+           AND am.account_id IN (t.paid_by_account_id, t.paid_to_account_id)
+       )
      GROUP BY t.id, paid_by_account.id, paid_by_account.name, paid_by_account.is_own, paid_by_account.account_type, paid_to_account.id, paid_to_account.name, paid_to_account.is_own, paid_to_account.account_type`,
-    [userId, id]
+    [id, userId, allowedRoles]
   );
 
   return result.rows[0] || null;
@@ -405,13 +485,19 @@ async function findTransaction(userId, id) {
   const result = await pool.query(
     `SELECT ${transactionSelect}
      FROM transactions t
-     LEFT JOIN accounts paid_by_account ON paid_by_account.user_id = t.user_id AND paid_by_account.id = t.paid_by_account_id
-     LEFT JOIN accounts paid_to_account ON paid_to_account.user_id = t.user_id AND paid_to_account.id = t.paid_to_account_id
+     LEFT JOIN accounts paid_by_account ON paid_by_account.id = t.paid_by_account_id
+     LEFT JOIN accounts paid_to_account ON paid_to_account.id = t.paid_to_account_id
      LEFT JOIN transaction_items ti ON ti.user_id = t.user_id AND ti.transaction_id = t.id
      LEFT JOIN categories c ON c.user_id = ti.user_id AND c.id = ti.category_id
-     WHERE t.user_id = $1 AND t.id = $2 AND t.deleted = false
+     WHERE t.id = $1 AND t.deleted = false
+       AND EXISTS (
+         SELECT 1
+         FROM account_members am
+         WHERE am.user_id = $2
+           AND am.account_id IN (t.paid_by_account_id, t.paid_to_account_id)
+       )
      GROUP BY t.id, paid_by_account.name, paid_to_account.name`,
-    [userId, id]
+    [id, userId]
   );
 
   if (result.rowCount === 0) {

@@ -5,11 +5,12 @@ import { ApiError, asyncHandler } from '../utils/errors.js';
 import { requireText } from '../utils/validation.js';
 import { hashPassword, verifyPassword } from '../utils/password.js';
 import { createSessionToken } from '../utils/tokens.js';
+import { attachSubscription } from '../billing/tiers.js';
 import { queuePasswordResetEmail } from '../utils/mailer.js';
 
 export const authRouter = Router();
 
-const userColumns = 'id, email, display_name AS "displayName"';
+const userColumns = 'id, email, display_name AS "displayName", role, status, plan_tier AS "planTier", plan_changed_at AS "planChangedAt", free_grace_started_at AS "freeGraceStartedAt"';
 
 function normalizeEmail(value) {
   const email = requireText(value, 'email').toLowerCase();
@@ -34,8 +35,8 @@ function generateTemporaryPassword() {
 
 function toAuthResponse(user) {
   return {
-    token: createSessionToken({ id: user.id, email: user.email, display_name: user.displayName }),
-    user
+    token: createSessionToken(user),
+    user: attachSubscription(user)
   };
 }
 
@@ -45,8 +46,8 @@ authRouter.post('/register', asyncHandler(async (req, res) => {
   const password = requirePassword(req.body.password);
 
   const result = await pool.query(
-    `INSERT INTO users (email, display_name, password_hash)
-     VALUES ($1, $2, $3)
+    `INSERT INTO users (email, display_name, password_hash, plan_tier, free_grace_started_at)
+     VALUES ($1, $2, $3, 'free', now())
      RETURNING ${userColumns}`,
     [email, displayName, hashPassword(password)]
   );
@@ -59,7 +60,15 @@ authRouter.post('/login', asyncHandler(async (req, res) => {
   const password = requireText(req.body.password, 'password');
 
   const result = await pool.query(
-    `SELECT id, email, display_name AS "displayName", password_hash AS "passwordHash"
+    `SELECT id,
+            email,
+            display_name AS "displayName",
+            role,
+            status,
+            plan_tier AS "planTier",
+            plan_changed_at AS "planChangedAt",
+            free_grace_started_at AS "freeGraceStartedAt",
+            password_hash AS "passwordHash"
      FROM users
      WHERE email = $1`,
     [email]
@@ -69,6 +78,16 @@ authRouter.post('/login', asyncHandler(async (req, res) => {
   if (!user || !verifyPassword(password, user.passwordHash)) {
     throw new ApiError(401, 'UNAUTHORIZED', 'Invalid email or password');
   }
+  if (user.status !== 'active') {
+    throw new ApiError(403, 'FORBIDDEN', 'User account is disabled');
+  }
+
+  await pool.query(
+    `UPDATE users
+     SET last_login_at = now()
+     WHERE id = $1`,
+    [user.id]
+  );
 
   delete user.passwordHash;
   res.json(toAuthResponse(user));
